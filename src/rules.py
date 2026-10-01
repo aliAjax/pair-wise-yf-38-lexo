@@ -8,9 +8,26 @@ from .domain import (
 )
 
 
+DEFAULT_CAPACITY = 1_000_000
+
+
+def _validate_capacity(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError("capacity must be a positive integer")
+    if value <= 0:
+        raise ValidationError("capacity must be a positive integer")
+
+
 def _validate_dataset(actor, data, lookup):
     if len(data.get("access_policy", "")) < 3:
         raise ValidationError("access_policy is required")
+    if "capacity" in data:
+        _validate_capacity(data["capacity"])
+
+
+def _validate_set_capacity(actor, entity, data, lookup):
+    _validate_capacity(data.get("capacity"))
+    return {"capacity": data["capacity"]}
 
 
 def _validate_application(actor, data, lookup):
@@ -40,17 +57,17 @@ def _validate_grant_activate(actor, entity, data, lookup):
 
 
 CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application}
-CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate}
+CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate, ('dataset', 'set_capacity'): _validate_set_capacity}
 
 
 class RuleEngine:
-    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant'}
+    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant', 'sessions': 'session'}
     INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued'}
-    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired')}}
+    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published'), 'set_capacity': (('registered', 'restricted', 'published'), None)}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired')}}
     CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient')}
-    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',)}
+    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('dataset', 'set_capacity'): ('capacity',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',)}
     CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee')}
-    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee')}
+    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'set_capacity': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -65,6 +82,9 @@ class RuleEngine:
     def _ensure_role(actor, allowed):
         if "*" not in allowed and actor.role not in allowed:
             raise PermissionDenied("role %s is not allowed here" % actor.role)
+
+    def ensure_role(self, actor, allowed):
+        self._ensure_role(actor, allowed)
 
     @staticmethod
     def _require(data, fields):
@@ -101,10 +121,20 @@ class RuleEngine:
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
+        if next_status is None:
+            next_status = entity["status"]
         patch = dict(data)
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def validate_activate(self, actor, data):
+        allowed_roles = self.ROLE_ACTIONS.get(("grant", "activate"), ("admin", "committee"))
+        self._ensure_role(actor, allowed_roles)
+        self._require(data, self.ACTION_REQUIRED.get(("grant", "activate"), ()))
+        if data.get("expires_at") < data.get("starts_at"):
+            raise ValidationError("grant expiry must be after start")
+        return {"activated_by": actor.user_id}
 
 
 def _find_one(lookup, kind, field, value):

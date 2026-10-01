@@ -34,6 +34,9 @@ class SQLiteRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_entities_kind_status
                     ON entities(kind, status);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_session_grant
+                    ON entities(json_extract(data, '$.grant_id'))
+                    WHERE kind = 'session';
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entity_id TEXT NOT NULL,
